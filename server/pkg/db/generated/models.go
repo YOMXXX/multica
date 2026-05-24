@@ -50,6 +50,16 @@ type Agent struct {
 	FixedRepoCleanupScript pgtype.Text        `json:"fixed_repo_cleanup_script"`
 }
 
+type AgentFixedRepoLock struct {
+	ID         pgtype.UUID        `json:"id"`
+	AgentID    pgtype.UUID        `json:"agent_id"`
+	Path       string             `json:"path"`
+	TaskID     pgtype.UUID        `json:"task_id"`
+	RuntimeID  pgtype.UUID        `json:"runtime_id"`
+	LockedAt   pgtype.Timestamptz `json:"locked_at"`
+	ReleasedAt pgtype.Timestamptz `json:"released_at"`
+}
+
 type AgentRuntime struct {
 	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`

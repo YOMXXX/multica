@@ -267,6 +267,10 @@ type AgentTaskResponse struct {
 	PriorSessionID          string                `json:"prior_session_id,omitempty"`          // session ID from a previous task on same issue
 	PriorWorkDir            string                `json:"prior_work_dir,omitempty"`            // work_dir from a previous task on same issue
 	WorkDir                 string                `json:"work_dir,omitempty"`                  // local working directory pinned for this task; populated once the daemon reports it
+	FixedRepoMode           bool                  `json:"fixed_repo_mode,omitempty"`           // true when the daemon must run this task in a pre-allocated fixed repo path
+	FixedRepoPath           string                `json:"fixed_repo_path,omitempty"`           // exclusive fixed repo path locked for this task
+	FixedRepoVcsType        string                `json:"fixed_repo_vcs_type,omitempty"`       // VCS mode for fixed repo execution: git, perforce, none, or custom
+	FixedRepoCleanupScript  *string               `json:"fixed_repo_cleanup_script,omitempty"` // optional script path for future cleanup support
 	TriggerCommentID        *string               `json:"trigger_comment_id,omitempty"`        // comment that triggered this task
 	TriggerCommentContent   string                `json:"trigger_comment_content,omitempty"`   // content of the triggering comment
 	TriggerSummary          *string               `json:"trigger_summary,omitempty"`           // canonical short description snapshot — comment text / autopilot title — taken at task creation; survives source edits/deletes

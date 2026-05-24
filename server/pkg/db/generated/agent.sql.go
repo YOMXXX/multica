@@ -11,6 +11,70 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acquireFixedRepoLockForTask = `-- name: AcquireFixedRepoLockForTask :one
+WITH existing AS (
+    SELECT l.id, l.agent_id, l.path, l.task_id, l.runtime_id, l.locked_at, l.released_at
+    FROM agent_fixed_repo_locks l
+    WHERE l.task_id = $1 AND l.released_at IS NULL
+),
+candidate AS (
+    SELECT p.path
+    FROM agent a
+    CROSS JOIN LATERAL jsonb_array_elements_text(a.fixed_repo_paths) WITH ORDINALITY AS p(path, ord)
+    WHERE a.id = $2
+      AND a.fixed_repo_enabled = TRUE
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_fixed_repo_locks l
+          WHERE l.agent_id = a.id
+            AND l.path = p.path
+            AND l.released_at IS NULL
+      )
+    ORDER BY p.ord
+    LIMIT 1
+),
+inserted AS (
+    INSERT INTO agent_fixed_repo_locks (agent_id, path, task_id, runtime_id)
+    SELECT $2, path, $1, $3 FROM candidate
+    ON CONFLICT DO NOTHING
+    RETURNING id, agent_id, path, task_id, runtime_id, locked_at, released_at
+)
+SELECT id, agent_id, path, task_id, runtime_id, locked_at, released_at FROM existing
+UNION ALL
+SELECT id, agent_id, path, task_id, runtime_id, locked_at, released_at FROM inserted
+LIMIT 1
+`
+
+type AcquireFixedRepoLockForTaskParams struct {
+	LockTaskID    pgtype.UUID `json:"lock_task_id"`
+	LockAgentID   pgtype.UUID `json:"lock_agent_id"`
+	LockRuntimeID pgtype.UUID `json:"lock_runtime_id"`
+}
+
+type AcquireFixedRepoLockForTaskRow struct {
+	ID         pgtype.UUID        `json:"id"`
+	AgentID    pgtype.UUID        `json:"agent_id"`
+	Path       string             `json:"path"`
+	TaskID     pgtype.UUID        `json:"task_id"`
+	RuntimeID  pgtype.UUID        `json:"runtime_id"`
+	LockedAt   pgtype.Timestamptz `json:"locked_at"`
+	ReleasedAt pgtype.Timestamptz `json:"released_at"`
+}
+
+func (q *Queries) AcquireFixedRepoLockForTask(ctx context.Context, arg AcquireFixedRepoLockForTaskParams) (AcquireFixedRepoLockForTaskRow, error) {
+	row := q.db.QueryRow(ctx, acquireFixedRepoLockForTask, arg.LockTaskID, arg.LockAgentID, arg.LockRuntimeID)
+	var i AcquireFixedRepoLockForTaskRow
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.Path,
+		&i.TaskID,
+		&i.RuntimeID,
+		&i.LockedAt,
+		&i.ReleasedAt,
+	)
+	return i, err
+}
+
 const archiveAgent = `-- name: ArchiveAgent :one
 UPDATE agent SET archived_at = now(), archived_by = $2, updated_at = now()
 WHERE id = $1
@@ -1210,6 +1274,52 @@ func (q *Queries) FailStaleTasks(ctx context.Context, arg FailStaleTasksParams) 
 	return items, nil
 }
 
+const getActiveFixedRepoLockForTask = `-- name: GetActiveFixedRepoLockForTask :one
+SELECT
+    l.id,
+    l.agent_id,
+    l.path,
+    l.task_id,
+    l.runtime_id,
+    l.locked_at,
+    l.released_at,
+    a.fixed_repo_vcs_type,
+    a.fixed_repo_cleanup_script
+FROM agent_fixed_repo_locks l
+JOIN agent a ON a.id = l.agent_id
+WHERE l.task_id = $1 AND l.released_at IS NULL
+LIMIT 1
+`
+
+type GetActiveFixedRepoLockForTaskRow struct {
+	ID                     pgtype.UUID        `json:"id"`
+	AgentID                pgtype.UUID        `json:"agent_id"`
+	Path                   string             `json:"path"`
+	TaskID                 pgtype.UUID        `json:"task_id"`
+	RuntimeID              pgtype.UUID        `json:"runtime_id"`
+	LockedAt               pgtype.Timestamptz `json:"locked_at"`
+	ReleasedAt             pgtype.Timestamptz `json:"released_at"`
+	FixedRepoVcsType       string             `json:"fixed_repo_vcs_type"`
+	FixedRepoCleanupScript pgtype.Text        `json:"fixed_repo_cleanup_script"`
+}
+
+func (q *Queries) GetActiveFixedRepoLockForTask(ctx context.Context, taskID pgtype.UUID) (GetActiveFixedRepoLockForTaskRow, error) {
+	row := q.db.QueryRow(ctx, getActiveFixedRepoLockForTask, taskID)
+	var i GetActiveFixedRepoLockForTaskRow
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.Path,
+		&i.TaskID,
+		&i.RuntimeID,
+		&i.LockedAt,
+		&i.ReleasedAt,
+		&i.FixedRepoVcsType,
+		&i.FixedRepoCleanupScript,
+	)
+	return i, err
+}
+
 const getAgent = `-- name: GetAgent :one
 SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, fixed_repo_enabled, fixed_repo_paths, fixed_repo_vcs_type, fixed_repo_cleanup_script FROM agent
 WHERE id = $1
@@ -2217,6 +2327,17 @@ func (q *Queries) RefreshAgentStatusFromTasks(ctx context.Context, id pgtype.UUI
 	return i, err
 }
 
+const releaseFixedRepoLockForTask = `-- name: ReleaseFixedRepoLockForTask :exec
+UPDATE agent_fixed_repo_locks
+SET released_at = now()
+WHERE task_id = $1 AND released_at IS NULL
+`
+
+func (q *Queries) ReleaseFixedRepoLockForTask(ctx context.Context, taskID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, releaseFixedRepoLockForTask, taskID)
+	return err
+}
+
 const restoreAgent = `-- name: RestoreAgent :one
 UPDATE agent SET archived_at = NULL, archived_by = NULL, updated_at = now()
 WHERE id = $1
@@ -2266,6 +2387,46 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 
 func (q *Queries) StartAgentTask(ctx context.Context, id pgtype.UUID) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, startAgentTask, id)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+	)
+	return i, err
+}
+
+const unclaimDispatchedTask = `-- name: UnclaimDispatchedTask :one
+UPDATE agent_task_queue
+SET status = 'queued', dispatched_at = NULL
+WHERE id = $1 AND status = 'dispatched'
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task
+`
+
+func (q *Queries) UnclaimDispatchedTask(ctx context.Context, id pgtype.UUID) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, unclaimDispatchedTask, id)
 	var i AgentTaskQueue
 	err := row.Scan(
 		&i.ID,

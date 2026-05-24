@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/daemonws"
@@ -1095,6 +1096,14 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp := taskToResponse(*task)
+	if lock, err := h.Queries.GetActiveFixedRepoLockForTask(r.Context(), task.ID); err == nil {
+		resp.FixedRepoMode = true
+		resp.FixedRepoPath = lock.Path
+		resp.FixedRepoVcsType = lock.FixedRepoVcsType
+		resp.FixedRepoCleanupScript = textToPtr(lock.FixedRepoCleanupScript)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("failed to load fixed repo lock for claim response", "task_id", uuidToString(task.ID), "error", err)
+	}
 	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
 		skills := h.TaskService.LoadAgentSkills(r.Context(), task.AgentID)
 		var customEnv map[string]string

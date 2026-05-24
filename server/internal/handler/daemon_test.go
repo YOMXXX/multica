@@ -423,6 +423,83 @@ func TestClaimTaskByRuntime_WorkspaceContextEmptyWhenUnset(t *testing.T) {
 	}
 }
 
+func TestClaimTaskByRuntime_FixedRepoMetadata(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createHandlerTestLocalRuntime(t, "fixed-repo-claim-response-runtime")
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id,
+			instructions, custom_env, custom_args,
+			fixed_repo_enabled, fixed_repo_paths, fixed_repo_vcs_type, fixed_repo_cleanup_script
+		)
+		VALUES ($1, 'fixed-repo-claim-response-agent', '', 'local', '{}'::jsonb, $2, 'private', 1, $3,
+			'', '{}'::jsonb, '[]'::jsonb, true, '["/fixed/claim-response"]'::jsonb, 'perforce', '/fixed/claim-response/cleanup.sh')
+		RETURNING id
+	`, testWorkspaceID, runtimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID) })
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES (
+			$1, 'fixed repo claim response issue', 'in_progress', 'none', $2, 'member',
+			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1),
+			0
+		)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 10)
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("create queued task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "fixed-repo-daemon")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ClaimTaskByRuntime: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Task *AgentTaskResponse `json:"task"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode claim response: %v", err)
+	}
+	if body.Task == nil {
+		t.Fatal("expected claimed task")
+	}
+	if !body.Task.FixedRepoMode {
+		t.Fatalf("expected fixed_repo_mode=true, got %+v", body.Task)
+	}
+	if body.Task.FixedRepoPath != "/fixed/claim-response" {
+		t.Fatalf("fixed_repo_path = %q", body.Task.FixedRepoPath)
+	}
+	if body.Task.FixedRepoVcsType != "perforce" {
+		t.Fatalf("fixed_repo_vcs_type = %q", body.Task.FixedRepoVcsType)
+	}
+	if body.Task.FixedRepoCleanupScript == nil || *body.Task.FixedRepoCleanupScript != "/fixed/claim-response/cleanup.sh" {
+		t.Fatalf("fixed_repo_cleanup_script = %#v", body.Task.FixedRepoCleanupScript)
+	}
+}
+
 func TestDaemonRegister_WithDaemonToken(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

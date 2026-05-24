@@ -410,6 +410,131 @@ func TestUpdateAgent_FixedRepoConfig_RejectsEmptyEnabledPaths(t *testing.T) {
 	}
 }
 
+func createFixedRepoAgentForClaimTest(t *testing.T, name string, maxTasks int) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	runtimeID := createHandlerTestLocalRuntime(t, name+"-runtime")
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id,
+			instructions, custom_env, custom_args,
+			fixed_repo_enabled, fixed_repo_paths, fixed_repo_vcs_type, fixed_repo_cleanup_script
+		)
+		VALUES ($1, $2, '', 'local', '{}'::jsonb, $3, 'private', $4, $5,
+			'', '{}'::jsonb, '[]'::jsonb, true, '["/fixed/one"]'::jsonb, 'git', '/fixed/one/cleanup.sh')
+		RETURNING id
+	`, testWorkspaceID, name, runtimeID, maxTasks, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("create fixed repo agent: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID)
+	})
+	return agentID, runtimeID
+}
+
+func createQueuedTaskForAgent(t *testing.T, agentID, runtimeID string, priority int) string {
+	t.Helper()
+	var taskID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority)
+		VALUES ($1, $2, 'queued', $3)
+		RETURNING id
+	`, agentID, runtimeID, priority).Scan(&taskID); err != nil {
+		t.Fatalf("create queued task: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	})
+	return taskID
+}
+
+func activeFixedRepoLockCount(t *testing.T, agentID string) int {
+	t.Helper()
+	var count int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT count(*) FROM agent_fixed_repo_locks
+		WHERE agent_id = $1 AND released_at IS NULL
+	`, agentID).Scan(&count); err != nil {
+		t.Fatalf("count fixed repo locks: %v", err)
+	}
+	return count
+}
+
+func TestFixedRepoClaim_AcquiresOnePathAndLeavesSecondTaskQueued(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID, runtimeID := createFixedRepoAgentForClaimTest(t, "fixed-repo-claim-lock", 2)
+	firstTaskID := createQueuedTaskForAgent(t, agentID, runtimeID, 10)
+	secondTaskID := createQueuedTaskForAgent(t, agentID, runtimeID, 9)
+
+	first, err := testHandler.TaskService.ClaimTask(ctx, parseUUID(agentID))
+	if err != nil {
+		t.Fatalf("first ClaimTask: %v", err)
+	}
+	if first == nil || uuidToString(first.ID) != firstTaskID {
+		t.Fatalf("first claim = %+v, want task %s", first, firstTaskID)
+	}
+
+	second, err := testHandler.TaskService.ClaimTask(ctx, parseUUID(agentID))
+	if err != nil {
+		t.Fatalf("second ClaimTask: %v", err)
+	}
+	if second != nil {
+		t.Fatalf("expected no second claim while fixed repo path is locked, got %+v", second)
+	}
+	if got := activeFixedRepoLockCount(t, agentID); got != 1 {
+		t.Fatalf("active lock count = %d, want 1", got)
+	}
+
+	var secondStatus string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, secondTaskID).Scan(&secondStatus); err != nil {
+		t.Fatalf("load second task status: %v", err)
+	}
+	if secondStatus != "queued" {
+		t.Fatalf("second task status = %q, want queued", secondStatus)
+	}
+}
+
+func TestFixedRepoClaim_ReleasesPathOnComplete(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID, runtimeID := createFixedRepoAgentForClaimTest(t, "fixed-repo-release", 2)
+	firstTaskID := createQueuedTaskForAgent(t, agentID, runtimeID, 10)
+	secondTaskID := createQueuedTaskForAgent(t, agentID, runtimeID, 9)
+
+	first, err := testHandler.TaskService.ClaimTask(ctx, parseUUID(agentID))
+	if err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	if first == nil || uuidToString(first.ID) != firstTaskID {
+		t.Fatalf("first claim = %+v, want task %s", first, firstTaskID)
+	}
+	if _, err := testHandler.TaskService.StartTask(ctx, first.ID); err != nil {
+		t.Fatalf("StartTask: %v", err)
+	}
+	if _, err := testHandler.TaskService.CompleteTask(ctx, first.ID, []byte(`{"output":"done"}`), "session-1", "/fixed/one"); err != nil {
+		t.Fatalf("CompleteTask: %v", err)
+	}
+	if got := activeFixedRepoLockCount(t, agentID); got != 0 {
+		t.Fatalf("active lock count after complete = %d, want 0", got)
+	}
+
+	second, err := testHandler.TaskService.ClaimTask(ctx, parseUUID(agentID))
+	if err != nil {
+		t.Fatalf("second ClaimTask after release: %v", err)
+	}
+	if second == nil || uuidToString(second.ID) != secondTaskID {
+		t.Fatalf("second claim = %+v, want task %s", second, secondTaskID)
+	}
+}
+
 func TestWorkspaceAlwaysRedactEnv(t *testing.T) {
 	tests := []struct {
 		name     string

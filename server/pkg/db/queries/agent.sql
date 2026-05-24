@@ -586,3 +586,62 @@ SET status = CASE WHEN EXISTS (
     updated_at = now()
 WHERE a.id = $1
 RETURNING *;
+
+-- name: AcquireFixedRepoLockForTask :one
+WITH existing AS (
+    SELECT l.id, l.agent_id, l.path, l.task_id, l.runtime_id, l.locked_at, l.released_at
+    FROM agent_fixed_repo_locks l
+    WHERE l.task_id = @lock_task_id AND l.released_at IS NULL
+),
+candidate AS (
+    SELECT p.path
+    FROM agent a
+    CROSS JOIN LATERAL jsonb_array_elements_text(a.fixed_repo_paths) WITH ORDINALITY AS p(path, ord)
+    WHERE a.id = @lock_agent_id
+      AND a.fixed_repo_enabled = TRUE
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_fixed_repo_locks l
+          WHERE l.agent_id = a.id
+            AND l.path = p.path
+            AND l.released_at IS NULL
+      )
+    ORDER BY p.ord
+    LIMIT 1
+),
+inserted AS (
+    INSERT INTO agent_fixed_repo_locks (agent_id, path, task_id, runtime_id)
+    SELECT @lock_agent_id, path, @lock_task_id, @lock_runtime_id FROM candidate
+    ON CONFLICT DO NOTHING
+    RETURNING id, agent_id, path, task_id, runtime_id, locked_at, released_at
+)
+SELECT * FROM existing
+UNION ALL
+SELECT * FROM inserted
+LIMIT 1;
+
+-- name: GetActiveFixedRepoLockForTask :one
+SELECT
+    l.id,
+    l.agent_id,
+    l.path,
+    l.task_id,
+    l.runtime_id,
+    l.locked_at,
+    l.released_at,
+    a.fixed_repo_vcs_type,
+    a.fixed_repo_cleanup_script
+FROM agent_fixed_repo_locks l
+JOIN agent a ON a.id = l.agent_id
+WHERE l.task_id = $1 AND l.released_at IS NULL
+LIMIT 1;
+
+-- name: ReleaseFixedRepoLockForTask :exec
+UPDATE agent_fixed_repo_locks
+SET released_at = now()
+WHERE task_id = $1 AND released_at IS NULL;
+
+-- name: UnclaimDispatchedTask :one
+UPDATE agent_task_queue
+SET status = 'queued', dispatched_at = NULL
+WHERE id = $1 AND status = 'dispatched'
+RETURNING *;

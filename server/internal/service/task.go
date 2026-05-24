@@ -85,6 +85,8 @@ const (
 	claimResponseRecoveryWindow = 90 * time.Second
 )
 
+var errFixedRepoPathUnavailable = errors.New("fixed repo path unavailable")
+
 // buildCommentTriggerSummary fetches the comment content and truncates
 // it for storage on the task row. Returns an invalid pgtype.Text when
 // the comment is missing (deleted / wrong workspace / etc) so the column
@@ -644,6 +646,7 @@ func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UU
 		return err
 	}
 	for _, t := range cancelled {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
 		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -663,6 +666,7 @@ func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UU
 		return nil, err
 	}
 	for _, t := range cancelled {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
 		s.captureTaskCancelled(ctx, t)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
 	}
@@ -685,6 +689,7 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 		return err
 	}
 	for _, t := range cancelled {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
 		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -698,6 +703,7 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 // that the tx might still roll back.
 func (s *TaskService) BroadcastCancelledTasks(ctx context.Context, cancelled []db.AgentTaskQueue) {
 	for _, t := range cancelled {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
 		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -706,6 +712,7 @@ func (s *TaskService) BroadcastCancelledTasks(ctx context.Context, cancelled []d
 
 func (s *TaskService) CaptureCancelledTasks(ctx context.Context, cancelled []db.AgentTaskQueue) {
 	for _, t := range cancelled {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
 		s.captureTaskCancelled(ctx, t)
 	}
 }
@@ -725,6 +732,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 		return nil, fmt.Errorf("cancel task: %w", err)
 	}
 
+	s.releaseFixedRepoLockForTask(ctx, s.Queries, task)
 	slog.Info("task cancelled", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskCancelled(ctx, task)
 
@@ -734,6 +742,40 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 	// Broadcast cancellation as a task:failed event so frontends clear the live card
 	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
 
+	return &task, nil
+}
+
+func (s *TaskService) releaseFixedRepoLockForTask(ctx context.Context, q *db.Queries, task db.AgentTaskQueue) {
+	if err := q.ReleaseFixedRepoLockForTask(ctx, task.ID); err != nil {
+		slog.Warn("release fixed repo lock failed",
+			"task_id", util.UUIDToString(task.ID),
+			"agent_id", util.UUIDToString(task.AgentID),
+			"error", err,
+		)
+	}
+}
+
+func (s *TaskService) claimTaskWithFixedRepoLock(ctx context.Context, q *db.Queries, agent db.Agent) (*db.AgentTaskQueue, error) {
+	task, err := q.ClaimAgentTask(ctx, agent.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !agent.FixedRepoEnabled {
+		return &task, nil
+	}
+	if _, err := q.AcquireFixedRepoLockForTask(ctx, db.AcquireFixedRepoLockForTaskParams{
+		LockAgentID:   agent.ID,
+		LockTaskID:    task.ID,
+		LockRuntimeID: task.RuntimeID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if _, resetErr := q.UnclaimDispatchedTask(ctx, task.ID); resetErr != nil {
+				return nil, fmt.Errorf("fixed repo path unavailable and unclaim failed: %w", resetErr)
+			}
+			return nil, errFixedRepoPathUnavailable
+		}
+		return nil, fmt.Errorf("acquire fixed repo lock: %w", err)
+	}
 	return &task, nil
 }
 
@@ -749,46 +791,62 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		s.maybeLogClaimSlow(agentID, outcome, start, getAgentMs, countRunningMs, claimAgentMs, updateStatusMs, dispatchMs)
 	}()
 
-	t0 := start
-	agent, err := s.Queries.GetAgent(ctx, agentID)
-	getAgentMs = time.Since(t0).Milliseconds()
-	if err != nil {
-		outcome = "error_get_agent"
-		return nil, fmt.Errorf("agent not found: %w", err)
-	}
-
-	t0 = time.Now()
-	running, err := s.Queries.CountRunningTasks(ctx, agentID)
-	countRunningMs = time.Since(t0).Milliseconds()
-	if err != nil {
-		outcome = "error_count_running"
-		return nil, fmt.Errorf("count running tasks: %w", err)
-	}
-	if running >= int64(agent.MaxConcurrentTasks) {
-		slog.Debug("task claim: no capacity", "agent_id", util.UUIDToString(agentID), "running", running, "max", agent.MaxConcurrentTasks)
-		outcome = "no_capacity"
-		return nil, nil // No capacity
-	}
-
-	t0 = time.Now()
-	task, err := s.Queries.ClaimAgentTask(ctx, agentID)
-	claimAgentMs = time.Since(t0).Milliseconds()
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			slog.Debug("task claim: no tasks available", "agent_id", util.UUIDToString(agentID))
-			outcome = "no_tasks"
-			return nil, nil // No tasks available
+	var task *db.AgentTaskQueue
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		t0 := start
+		agent, err := qtx.GetAgent(ctx, agentID)
+		getAgentMs = time.Since(t0).Milliseconds()
+		if err != nil {
+			outcome = "error_get_agent"
+			return fmt.Errorf("agent not found: %w", err)
 		}
-		outcome = "error_claim"
-		return nil, fmt.Errorf("claim task: %w", err)
+
+		t0 = time.Now()
+		running, err := qtx.CountRunningTasks(ctx, agentID)
+		countRunningMs = time.Since(t0).Milliseconds()
+		if err != nil {
+			outcome = "error_count_running"
+			return fmt.Errorf("count running tasks: %w", err)
+		}
+		if running >= int64(agent.MaxConcurrentTasks) {
+			slog.Debug("task claim: no capacity", "agent_id", util.UUIDToString(agentID), "running", running, "max", agent.MaxConcurrentTasks)
+			outcome = "no_capacity"
+			return nil
+		}
+
+		t0 = time.Now()
+		claimed, err := s.claimTaskWithFixedRepoLock(ctx, qtx, agent)
+		claimAgentMs = time.Since(t0).Milliseconds()
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				slog.Debug("task claim: no tasks available", "agent_id", util.UUIDToString(agentID))
+				outcome = "no_tasks"
+				return nil
+			}
+			if errors.Is(err, errFixedRepoPathUnavailable) {
+				slog.Debug("task claim: no fixed repo path available", "agent_id", util.UUIDToString(agentID))
+				outcome = "no_fixed_repo_path"
+				return nil
+			}
+			outcome = "error_claim"
+			return fmt.Errorf("claim task: %w", err)
+		}
+		task = claimed
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		return nil, nil
 	}
 
 	slog.Info("task claimed", "task_id", util.UUIDToString(task.ID), "agent_id", util.UUIDToString(agentID))
-	s.captureTaskDispatched(ctx, task)
+	s.captureTaskDispatched(ctx, *task)
 
 	// Refresh agent status from active tasks. This avoids a stale unconditional
 	// working write racing after a just-cancelled claim.
-	t0 = time.Now()
+	t0 := time.Now()
 	s.ReconcileAgentStatus(ctx, agentID)
 	updateStatusMs = time.Since(t0).Milliseconds()
 
@@ -796,11 +854,11 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 	// re-query issue/chat_session/autopilot_run, so it can also be a real
 	// contributor to claim latency.
 	t0 = time.Now()
-	s.broadcastTaskDispatch(ctx, task)
+	s.broadcastTaskDispatch(ctx, *task)
 	dispatchMs = time.Since(t0).Milliseconds()
 
 	outcome = "claimed"
-	return &task, nil
+	return task, nil
 }
 
 // ClaimTaskForRuntime claims the next runnable task for a runtime while
@@ -980,6 +1038,7 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 			return err
 		}
 		task = t
+		s.releaseFixedRepoLockForTask(ctx, qtx, t)
 
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
@@ -1159,6 +1218,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 			return err
 		}
 		task = t
+		s.releaseFixedRepoLockForTask(ctx, qtx, t)
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.
@@ -1438,6 +1498,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		)
 	}
 	for _, t := range cancelled {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
 		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -1492,6 +1553,8 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 	retried := 0
 
 	for _, t := range tasks {
+		s.releaseFixedRepoLockForTask(ctx, s.Queries, t)
+
 		// Auto-retry first so the issue stays in_progress rather than
 		// flapping todo → in_progress within a tick.
 		if child, _ := s.MaybeRetryFailedTask(ctx, t); child != nil {
