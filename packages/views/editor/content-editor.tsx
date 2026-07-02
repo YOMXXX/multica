@@ -41,6 +41,7 @@ import {
 } from "react";
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
 import { cn } from "@multica/ui/lib/utils";
+import { LARGE_TEXT_THRESHOLD } from "@multica/ui/markdown";
 import type { UploadResult } from "@multica/core/hooks/use-file-upload";
 import { useWorkspaceSlug } from "@multica/core/paths";
 import { useQueryClient } from "@tanstack/react-query";
@@ -86,6 +87,22 @@ function normalizeMarkdown(md: string): string {
 /** `normalizeMarkdown` applied to the live editor's serialized content. */
 function normalizeEditorMarkdown(editor: Editor): string {
   return normalizeMarkdown(editor.getMarkdown());
+}
+
+function plainCodeBlockDoc(text: string) {
+  return {
+    type: "doc",
+    content: [
+      {
+        type: "codeBlock",
+        content: [{ type: "text", text }],
+      },
+    ],
+  };
+}
+
+function shouldBypassMarkdownParse(markdown: string): boolean {
+  return markdown.length > LARGE_TEXT_THRESHOLD;
 }
 
 /** True when any node in the document is mid-upload (`attrs.uploading`). The
@@ -220,6 +237,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     >(undefined);
     const mentionContextItemsRef = useRef<MentionItem[]>(mentionContextItems ?? []);
     const lastEmittedRef = useRef<string | null>(null);
+    const bypassedMarkdownRef = useRef<string | null>(null);
 
     // In-session record of attachments freshly uploaded through this editor.
     // Surfaces (like the quick-create modal) that don't have a server-supplied
@@ -299,9 +317,12 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     const queryClient = useQueryClient();
 
     const initialContent = defaultValue ? preprocessMarkdown(defaultValue) : "";
-    // Large markdown is parsed in chunks to dodge marked's O(n²) tokenizer (see
-    // parseMarkdownChunked). Small docs stay on the single-parse fast path.
-    const mountChunked = initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
+    const mountPlainCodeBlock = shouldBypassMarkdownParse(initialContent);
+    // Very large markdown bypasses the parser entirely and mounts as a plain
+    // code block. The chunked path is kept as a bounded fallback if this guard
+    // is ever raised while still staying below the unsafe whole-parse size.
+    const mountChunked =
+      !mountPlainCodeBlock && initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
 
     const editor = useEditor({
       immediatelyRender: false,
@@ -330,10 +351,15 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
         // after typing `1.`) parses into a caretless, schema-invalid item;
         // repair it so the mounted editor has a real cursor in the list.
         repairEmptyListItems(ed);
+        bypassedMarkdownRef.current = mountPlainCodeBlock ? initialContent : null;
         lastEmittedRef.current = normalizeEditorMarkdown(ed);
       },
-      content: mountChunked ? "" : initialContent,
-      contentType: mountChunked
+      content: mountPlainCodeBlock
+        ? plainCodeBlockDoc(initialContent)
+        : mountChunked
+          ? ""
+          : initialContent,
+      contentType: mountPlainCodeBlock || mountChunked
         ? undefined
         : defaultValue
           ? "markdown"
@@ -446,6 +472,8 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       if (isDirty) return;
 
       const incoming = defaultValue ? preprocessMarkdown(defaultValue) : "";
+      const bypassIncoming = shouldBypassMarkdownParse(incoming);
+      if (bypassIncoming && bypassedMarkdownRef.current === incoming) return;
       const incomingNormalized = normalizeMarkdown(incoming);
       // Guard 3: normalized-equal short-circuit. Avoids a no-op transaction
       // when the cache reflects a write this same editor just emitted.
@@ -457,19 +485,26 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       const { from, to } = editor.state.selection;
       // Same chunked path on WS-driven re-parse of a large description.
       const manager =
-        incoming.length > MARKDOWN_CHUNK_THRESHOLD
+        !bypassIncoming && incoming.length > MARKDOWN_CHUNK_THRESHOLD
           ? (editor.storage as { markdown?: { manager?: MarkdownManagerLike } })
               .markdown?.manager
           : undefined;
-      if (manager) {
+      if (bypassIncoming) {
+        editor.commands.setContent(plainCodeBlockDoc(incoming), {
+          emitUpdate: false,
+        });
+        bypassedMarkdownRef.current = incoming;
+      } else if (manager) {
         editor.commands.setContent(parseMarkdownChunked(manager, incoming), {
           emitUpdate: false,
         });
+        bypassedMarkdownRef.current = null;
       } else {
         editor.commands.setContent(incoming, {
           emitUpdate: false,
           contentType: "markdown",
         });
+        bypassedMarkdownRef.current = null;
       }
 
       // An empty list item in the incoming markdown parses into a caretless,
