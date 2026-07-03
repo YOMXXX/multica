@@ -374,6 +374,7 @@ export function ChatInput({
             }}
             onSubmit={handleSend}
             onUploadFile={uploadEnabled ? handleUpload : undefined}
+            largePasteMode="file"
             attachments={draftAttachments}
             debounceMs={100}
             mentionMode={contextItems ? "context" : "default"}

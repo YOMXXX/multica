@@ -58,8 +58,13 @@ function ReplyInput({
   const initialDraft = draftKey
     ? useCommentDraftStore.getState().getDraft(draftKey)
     : undefined;
+  const initialDraftAttachments = draftKey
+    ? useCommentDraftStore.getState().getDraftAttachments(draftKey)
+    : [];
   const [content, setContent] = useState(initialDraft ?? "");
   const setDraft = useCommentDraftStore((s) => s.setDraft);
+  const setDraftAttachments = useCommentDraftStore((s) => s.setDraftAttachments);
+  const addDraftAttachment = useCommentDraftStore((s) => s.addDraftAttachment);
   const clearDraft = useCommentDraftStore((s) => s.clearDraft);
   const [isEmpty, setIsEmpty] = useState(!initialDraft?.trim());
   const [submitting, setSubmitting] = useState(false);
@@ -67,18 +72,37 @@ function ReplyInput({
   const triggerPreview = useCommentTriggerPreview({ issueId, parentId, content });
   // Attachments uploaded in this composer session — see CommentInput for the
   // rationale (drives both submit-time attachment_ids and editor previews).
-  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>(
+    initialDraftAttachments,
+  );
   const { uploadWithToast } = useFileUpload(api);
   const { isDragOver, dropZoneProps } = useFileDropZone({
     onDrop: (files) => files.forEach((f) => editorRef.current?.uploadFile(f)),
   });
 
   // Flush on tab close / mobile background — same rationale as CommentInput.
+  const pruneDraftAttachments = useCallback(
+    (md: string, attachments: Attachment[]) => {
+      if (!draftKey || attachments.length === 0) return;
+      const referenced = attachments.filter((attachment) =>
+        contentReferencesAttachment(md, attachment),
+      );
+      if (referenced.length !== attachments.length) {
+        setPendingAttachments(referenced);
+      }
+      setDraftAttachments(draftKey, referenced);
+    },
+    [draftKey, setDraftAttachments],
+  );
+
   useEffect(() => {
     if (!draftKey) return;
     const flush = () => {
       const md = editorRef.current?.getMarkdown();
-      if (md && md.trim().length > 0) setDraft(draftKey, md);
+      if (md && md.trim().length > 0) {
+        setDraft(draftKey, md);
+        pruneDraftAttachments(md, pendingAttachments);
+      }
     };
     const onVis = () => { if (document.visibilityState === "hidden") flush(); };
     document.addEventListener("visibilitychange", onVis);
@@ -87,15 +111,22 @@ function ReplyInput({
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("pagehide", flush);
     };
-  }, [draftKey, setDraft]);
+  }, [draftKey, pendingAttachments, pruneDraftAttachments, setDraft]);
 
   const handleUpload = useCallback(async (file: File) => {
     const result = await uploadWithToast(file, { issueId });
     if (result) {
-      setPendingAttachments((prev) => [...prev, result]);
+      setPendingAttachments((prev) =>
+        prev.some((attachment) => attachment.id === result.id)
+          ? prev.map((attachment) =>
+              attachment.id === result.id ? result : attachment,
+            )
+          : [...prev, result],
+      );
+      if (draftKey) addDraftAttachment(draftKey, result);
     }
     return result;
-  }, [uploadWithToast, issueId]);
+  }, [addDraftAttachment, draftKey, uploadWithToast, issueId]);
 
   useEffect(() => {
     setSuppressedAgentIds(new Set());
@@ -185,12 +216,18 @@ function ReplyInput({
               setContent(md);
               setIsEmpty(!md.trim());
               if (draftKey) {
-                if (md.trim().length > 0) setDraft(draftKey, md);
-                else clearDraft(draftKey);
+                if (md.trim().length > 0) {
+                  setDraft(draftKey, md);
+                  pruneDraftAttachments(md, pendingAttachments);
+                } else {
+                  setPendingAttachments([]);
+                  clearDraft(draftKey);
+                }
               }
             }}
             onSubmit={handleSubmit}
             onUploadFile={handleUpload}
+            largePasteMode={draftKey ? "file" : "codeBlock"}
             debounceMs={100}
             currentIssueId={issueId}
             attachments={pendingAttachments}

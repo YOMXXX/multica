@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import { Markdown } from "@tiptap/markdown";
@@ -7,6 +7,8 @@ import { createEditorExtensions } from ".";
 let editor: Editor | null = null;
 
 interface JsonNode {
+  type?: string;
+  text?: string;
   marks?: Array<{ type: string }>;
   content?: JsonNode[];
 }
@@ -17,7 +19,9 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-function makeProductionEditor(): Editor {
+function makeProductionEditor(
+  options: Partial<Parameters<typeof createEditorExtensions>[0]> = {},
+): Editor {
   const element = document.createElement("div");
   document.body.appendChild(element);
 
@@ -28,6 +32,7 @@ function makeProductionEditor(): Editor {
       disableMentions: true,
       enableSlashCommands: false,
       onUploadFileRef: { current: undefined },
+      ...options,
     }),
   });
 }
@@ -60,6 +65,38 @@ function typeText(ed: Editor, text: string) {
 function hasCodeMark(node: JsonNode): boolean {
   if (node.marks?.some((mark) => mark.type === "code")) return true;
   return (node.content ?? []).some(hasCodeMark);
+}
+
+function fakePasteEvent(text: string) {
+  return {
+    clipboardData: {
+      files: [],
+      getData: (type: string) => (type === "text/plain" ? text : ""),
+    },
+  } as unknown as ClipboardEvent;
+}
+
+function paste(editor: Editor, text: string): boolean {
+  const event = fakePasteEvent(text);
+  return (
+    editor.view.someProp("handlePaste", (handler) =>
+      handler(editor.view, event, editor.view.state.selection.content()),
+    ) === true
+  );
+}
+
+function findFirst(json: JsonNode, type: string): JsonNode | undefined {
+  if (json.type === type) return json;
+  for (const child of json.content ?? []) {
+    const hit = findFirst(child, type);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+function nodeText(node: JsonNode): string {
+  if (node.text !== undefined) return node.text;
+  return (node.content ?? []).map(nodeText).join("");
 }
 
 describe("inline code input rule", () => {
@@ -101,5 +138,40 @@ describe("inline code paste rule", () => {
 
     expect(editor.getText()).toBe("abcd123");
     expect(editor.getMarkdown().trim()).toBe("abcd`123`");
+  });
+});
+
+describe("large text paste file mode", () => {
+  it("defaults to a plain code block even when an upload handler exists", () => {
+    const upload = vi.fn(async (_file: File) => null);
+    editor = makeProductionEditor({
+      onUploadFileRef: { current: upload },
+    });
+    const text = "large paste\n" + "payload\n".repeat(700);
+
+    const handled = paste(editor, text);
+
+    expect(handled).toBe(true);
+    expect(upload).not.toHaveBeenCalled();
+    const codeBlock = findFirst(editor.getJSON() as JsonNode, "codeBlock");
+    expect(codeBlock).toBeDefined();
+    expect(nodeText(codeBlock!)).toBe(text);
+  });
+
+  it("creates pasted-text.txt only when largePasteMode is file", () => {
+    const upload = vi.fn(async (_file: File) => null);
+    editor = makeProductionEditor({
+      largePasteMode: "file",
+      onUploadFileRef: { current: upload },
+    });
+    const text = "large paste\n" + "payload\n".repeat(700);
+
+    const handled = paste(editor, text);
+
+    expect(handled).toBe(true);
+    expect(upload).toHaveBeenCalledTimes(1);
+    const file = upload.mock.calls[0]?.[0] as File;
+    expect(file.name).toBe("pasted-text.txt");
+    expect(file.type).toBe("text/plain");
   });
 });

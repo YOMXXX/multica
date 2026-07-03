@@ -332,15 +332,46 @@ function useEditAttachmentState(
     content: editing ? content : "",
   });
 
+  const draftKey = `edit:${issueId}:${entry.id}` as const;
+  const getDraft = useCommentDraftStore.getState().getDraft;
+  const getDraftAttachments = useCommentDraftStore.getState().getDraftAttachments;
+  const setDraft = useCommentDraftStore((s) => s.setDraft);
+  const setDraftAttachments = useCommentDraftStore((s) => s.setDraftAttachments);
+  const addDraftAttachment = useCommentDraftStore((s) => s.addDraftAttachment);
+  const clearDraft = useCommentDraftStore((s) => s.clearDraft);
+
   const editorAttachments = pendingAttachments.length > 0
     ? [...(entry.attachments ?? []), ...pendingAttachments]
     : entry.attachments;
 
+  const pruneDraftAttachments = useCallback(
+    (md: string, attachments: Attachment[]) => {
+      if (attachments.length === 0) return;
+      const referenced = attachments.filter((attachment) =>
+        contentReferencesAttachment(md, attachment),
+      );
+      if (referenced.length !== attachments.length) {
+        setPendingAttachments(referenced);
+      }
+      setDraftAttachments(draftKey, referenced);
+    },
+    [draftKey, setDraftAttachments],
+  );
+
   const handleUpload = useCallback(async (file: File) => {
     const result = await uploadWithToast(file, { issueId });
-    if (result) setPendingAttachments((prev) => [...prev, result]);
+    if (result) {
+      setPendingAttachments((prev) =>
+        prev.some((attachment) => attachment.id === result.id)
+          ? prev.map((attachment) =>
+              attachment.id === result.id ? result : attachment,
+            )
+          : [...prev, result],
+      );
+      addDraftAttachment(draftKey, result);
+    }
     return result;
-  }, [uploadWithToast, issueId]);
+  }, [addDraftAttachment, draftKey, uploadWithToast, issueId]);
 
   useEffect(() => {
     setSuppressedAgentIds(new Set());
@@ -351,14 +382,29 @@ function useEditAttachmentState(
     enabled: editing,
   });
 
-  const draftKey = `edit:${issueId}:${entry.id}` as const;
-  const getDraft = useCommentDraftStore.getState().getDraft;
-  const setDraft = useCommentDraftStore((s) => s.setDraft);
-  const clearDraft = useCommentDraftStore((s) => s.clearDraft);
-
   const initialValue = editing
     ? (getDraft(draftKey) ?? entry.content ?? "")
     : (entry.content ?? "");
+
+  const updateDraftContent = useCallback(
+    (md: string) => {
+      setContent(md);
+      if (md.trim().length > 0) {
+        setDraft(draftKey, md);
+        pruneDraftAttachments(md, pendingAttachments);
+      } else {
+        setPendingAttachments([]);
+        clearDraft(draftKey);
+      }
+    },
+    [
+      clearDraft,
+      draftKey,
+      pendingAttachments,
+      pruneDraftAttachments,
+      setDraft,
+    ],
+  );
 
   useEffect(() => {
     const visible = new Set(triggerPreview.agents.map((agent) => agent.id));
@@ -392,6 +438,7 @@ function useEditAttachmentState(
 
   const startEdit = () => {
     cancelledRef.current = false;
+    setPendingAttachments(getDraftAttachments(draftKey));
     setContent(getDraft(draftKey) ?? entry.content ?? "");
     setRetainedStandaloneIds(initialStandaloneAttachmentIds(entry));
     setEditing(true);
@@ -456,9 +503,7 @@ function useEditAttachmentState(
     suppressedAgentIds,
     toggleSuppressedAgent,
     draftKey,
-    setDraft,
-    setContent,
-    clearDraft,
+    updateDraftContent,
     initialValue,
     standaloneEditAttachments,
     retainedStandaloneIds,
@@ -618,13 +663,10 @@ function CommentRow({
               ref={edit.editorRef}
               defaultValue={edit.initialValue}
               placeholder={t(($) => $.comment.edit_placeholder)}
-              onUpdate={(md) => {
-                edit.setContent(md);
-                if (md.trim().length > 0) edit.setDraft(edit.draftKey, md);
-                else edit.clearDraft(edit.draftKey);
-              }}
+              onUpdate={edit.updateDraftContent}
               onSubmit={edit.saveEdit}
               onUploadFile={edit.handleUpload}
+              largePasteMode="file"
               debounceMs={100}
               currentIssueId={issueId}
               attachments={edit.editorAttachments}
@@ -908,13 +950,10 @@ function CommentCardImpl({
                     ref={edit.editorRef}
                     defaultValue={edit.initialValue}
                     placeholder={t(($) => $.comment.edit_placeholder)}
-                    onUpdate={(md) => {
-                      edit.setContent(md);
-                      if (md.trim().length > 0) edit.setDraft(edit.draftKey, md);
-                      else edit.clearDraft(edit.draftKey);
-                    }}
+                    onUpdate={edit.updateDraftContent}
                     onSubmit={edit.saveEdit}
                     onUploadFile={edit.handleUpload}
+                    largePasteMode="file"
                     debounceMs={100}
                     currentIssueId={issueId}
                     attachments={edit.editorAttachments}

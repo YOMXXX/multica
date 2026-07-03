@@ -32,6 +32,9 @@ function CommentInput({ issueId, onSubmit }: CommentInputProps) {
   // button would be disabled even though the editor visibly contains text.
   const draftKey = `new:${issueId}` as const;
   const initialDraft = useCommentDraftStore.getState().getDraft(draftKey);
+  const initialDraftAttachments = useCommentDraftStore
+    .getState()
+    .getDraftAttachments(draftKey);
   const [content, setContent] = useState(initialDraft ?? "");
   const [isEmpty, setIsEmpty] = useState(() => !initialDraft?.trim());
   const [submitting, setSubmitting] = useState(false);
@@ -41,7 +44,9 @@ function CommentInput({ issueId, onSubmit }: CommentInputProps) {
   //  - submit-time `attachment_ids` payload (filtered to URLs still in markdown)
   //  - the editor's AttachmentDownloadProvider, so file-card Eye buttons can
   //    resolve text/code/markdown previews that require the attachment id.
-  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>(
+    initialDraftAttachments,
+  );
   const { uploadWithToast } = useFileUpload(api);
   const { isDragOver, dropZoneProps } = useFileDropZone({
     onDrop: (files) => files.forEach((f) => editorRef.current?.uploadFile(f)),
@@ -52,11 +57,29 @@ function CommentInput({ issueId, onSubmit }: CommentInputProps) {
   // Flush on every onUpdate (debounced upstream) + visibilitychange/pagehide
   // so tab close / mobile background doesn't lose work. Cleared on submit.
   const setDraft = useCommentDraftStore((s) => s.setDraft);
+  const setDraftAttachments = useCommentDraftStore((s) => s.setDraftAttachments);
+  const addDraftAttachment = useCommentDraftStore((s) => s.addDraftAttachment);
   const clearDraft = useCommentDraftStore((s) => s.clearDraft);
+  const pruneDraftAttachments = useCallback(
+    (md: string, attachments: Attachment[]) => {
+      if (attachments.length === 0) return;
+      const referenced = attachments.filter((attachment) =>
+        contentReferencesAttachment(md, attachment),
+      );
+      if (referenced.length !== attachments.length) {
+        setPendingAttachments(referenced);
+      }
+      setDraftAttachments(draftKey, referenced);
+    },
+    [draftKey, setDraftAttachments],
+  );
   useEffect(() => {
     const flush = () => {
       const md = editorRef.current?.getMarkdown();
-      if (md && md.trim().length > 0) setDraft(draftKey, md);
+      if (md && md.trim().length > 0) {
+        setDraft(draftKey, md);
+        pruneDraftAttachments(md, pendingAttachments);
+      }
     };
     const onVis = () => { if (document.visibilityState === "hidden") flush(); };
     document.addEventListener("visibilitychange", onVis);
@@ -65,15 +88,22 @@ function CommentInput({ issueId, onSubmit }: CommentInputProps) {
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("pagehide", flush);
     };
-  }, [draftKey, setDraft]);
+  }, [draftKey, pendingAttachments, pruneDraftAttachments, setDraft]);
 
   const handleUpload = useCallback(async (file: File) => {
     const result = await uploadWithToast(file, { issueId });
     if (result) {
-      setPendingAttachments((prev) => [...prev, result]);
+      setPendingAttachments((prev) =>
+        prev.some((attachment) => attachment.id === result.id)
+          ? prev.map((attachment) =>
+              attachment.id === result.id ? result : attachment,
+            )
+          : [...prev, result],
+      );
+      addDraftAttachment(draftKey, result);
     }
     return result;
-  }, [uploadWithToast, issueId]);
+  }, [addDraftAttachment, draftKey, uploadWithToast, issueId]);
 
   useEffect(() => {
     setSuppressedAgentIds(new Set());
@@ -159,11 +189,17 @@ function CommentInput({ issueId, onSubmit }: CommentInputProps) {
             setIsEmpty(!md.trim());
             // Debounced upstream (debounceMs=100). Persist on every tick so a
             // reload or scroll-out-of-viewport restores work to the keystroke.
-            if (md.trim().length > 0) setDraft(draftKey, md);
-            else clearDraft(draftKey);
+            if (md.trim().length > 0) {
+              setDraft(draftKey, md);
+              pruneDraftAttachments(md, pendingAttachments);
+            } else {
+              setPendingAttachments([]);
+              clearDraft(draftKey);
+            }
           }}
           onSubmit={handleSubmit}
           onUploadFile={handleUpload}
+          largePasteMode="file"
           debounceMs={100}
           currentIssueId={issueId}
           attachments={pendingAttachments}

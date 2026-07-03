@@ -148,6 +148,8 @@ export interface EditorExtensionsOptions {
   onUploadFileRef?: RefObject<
     ((file: File) => Promise<UploadResult | null>) | undefined
   >;
+  /** Large text paste behavior. Defaults to plain code block insertion. */
+  largePasteMode?: "codeBlock" | "file";
   /** When true, bare Enter also submits (chat-style). Default false. */
   submitOnEnter?: boolean;
   /**
@@ -247,6 +249,7 @@ export function createEditorExtensions(
     Placeholder.configure({ placeholder: placeholderText }),
     createMarkdownPasteExtension({
       handleLargeTextPaste: (text, editor) => {
+        if (options.largePasteMode !== "file") return false;
         const handler = options.onUploadFileRef?.current;
         const file = handler ? makePastedTextFile(text) : null;
         if (!handler || !file) return false;

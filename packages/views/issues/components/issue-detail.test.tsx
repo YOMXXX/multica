@@ -285,7 +285,10 @@ vi.mock("@multica/core/issues/stores", () => ({
       const state = {
         drafts: {} as Record<string, { content: string; updatedAt: number }>,
         getDraft: () => undefined,
+        getDraftAttachments: () => [],
         setDraft: () => {},
+        setDraftAttachments: () => {},
+        addDraftAttachment: () => {},
         clearDraft: () => {},
       };
       return selector ? selector(state) : state;
@@ -294,7 +297,10 @@ vi.mock("@multica/core/issues/stores", () => ({
       getState: () => ({
         drafts: {} as Record<string, { content: string; updatedAt: number }>,
         getDraft: () => undefined,
+        getDraftAttachments: () => [],
         setDraft: () => {},
+        setDraftAttachments: () => {},
+        addDraftAttachment: () => {},
         clearDraft: () => {},
       }),
     },

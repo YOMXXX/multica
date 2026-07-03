@@ -3,6 +3,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import type { UploadResult } from "@multica/core/hooks/use-file-upload";
+import type { Attachment } from "@multica/core/types";
+import {
+  useCommentDraftStore,
+  type CommentDraftKey,
+} from "@multica/core/issues/stores";
 import { renderWithI18n } from "../../test/i18n";
 import { CommentInput } from "./comment-input";
 import { ReplyInput } from "./reply-input";
@@ -37,11 +42,15 @@ vi.mock("../../editor", () => ({
       onUpdate,
       placeholder,
       onUploadFile,
+      largePasteMode,
+      attachments,
     }: {
       defaultValue?: string;
       onUpdate?: (markdown: string) => void;
       placeholder?: string;
       onUploadFile?: (file: File) => Promise<UploadResult | null>;
+      largePasteMode?: "codeBlock" | "file";
+      attachments?: Attachment[];
     },
     ref: Ref<unknown>,
   ) {
@@ -66,6 +75,8 @@ vi.mock("../../editor", () => ({
     return (
       <textarea
         data-testid="editor"
+        data-large-paste-mode={largePasteMode ?? ""}
+        data-attachment-count={attachments?.length ?? 0}
         defaultValue={defaultValue}
         placeholder={placeholder}
         onChange={(event) => {
@@ -96,9 +107,11 @@ function renderCommentInput(onSubmit = vi.fn().mockResolvedValue(true)) {
 function renderReplyInput({
   onSubmit = vi.fn().mockResolvedValue(true),
   size = "sm",
+  draftKey = "reply:issue-1:comment-1" as CommentDraftKey,
 }: {
   onSubmit?: (content: string, attachmentIds?: string[], suppressAgentIds?: string[]) => Promise<boolean>;
   size?: "sm" | "default";
+  draftKey?: CommentDraftKey;
 } = {}) {
   const view = renderWithProviders(
     <ReplyInput
@@ -108,6 +121,7 @@ function renderReplyInput({
       avatarId="user-1"
       onSubmit={onSubmit}
       size={size}
+      draftKey={draftKey}
     />,
   );
   return { ...view, onSubmit };
@@ -119,9 +133,38 @@ function getSubmitButton(container: HTMLElement): HTMLButtonElement {
   return button;
 }
 
+function getFileInput(container: HTMLElement): HTMLInputElement {
+  const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+  if (!input) throw new Error("Expected file input to render");
+  return input;
+}
+
+function makeUploadResult(id: string): UploadResult {
+  return {
+    id,
+    workspace_id: "ws-1",
+    issue_id: "issue-1",
+    comment_id: null,
+    chat_session_id: null,
+    chat_message_id: null,
+    uploader_type: "member",
+    uploader_id: "user-1",
+    filename: `${id}.txt`,
+    url: `/api/attachments/${id}/download`,
+    download_url: `/api/attachments/${id}/download`,
+    markdown_url: `/api/attachments/${id}/download`,
+    content_type: "text/plain",
+    size_bytes: 12,
+    created_at: new Date(0).toISOString(),
+    link: `/api/attachments/${id}/download`,
+    markdownLink: `/api/attachments/${id}/download`,
+  };
+}
+
 beforeEach(() => {
   uploadWithToast.mockReset();
   localStorage.clear();
+  useCommentDraftStore.setState({ drafts: {} });
 });
 
 describe("comment composers", () => {
@@ -149,6 +192,21 @@ describe("comment composers", () => {
     expect(shell.className).not.toContain("h-[60vh]");
   });
 
+  it("enables large paste file mode for main comments and replies", () => {
+    const comment = renderCommentInput();
+    expect(screen.getByTestId("editor")).toHaveAttribute(
+      "data-large-paste-mode",
+      "file",
+    );
+    comment.unmount();
+
+    renderReplyInput();
+    expect(screen.getByTestId("editor")).toHaveAttribute(
+      "data-large-paste-mode",
+      "file",
+    );
+  });
+
   it("lets default-size replies grow without a height cap", () => {
     const { container } = renderReplyInput({ size: "default" });
 
@@ -169,6 +227,49 @@ describe("comment composers", () => {
 
     await waitFor(() => {
       expect(onSubmit).toHaveBeenCalledWith("hello from composer", undefined, undefined);
+    });
+  });
+
+  it("persists uploaded main comment attachment drafts and submits active ids", async () => {
+    const uploadResult = makeUploadResult("att-1");
+    uploadWithToast.mockResolvedValue(uploadResult);
+    const { container, onSubmit } = renderCommentInput();
+
+    fireEvent.change(getFileInput(container), {
+      target: {
+        files: [
+          new File(["payload"], "pasted-text.txt", { type: "text/plain" }),
+        ],
+      },
+    });
+
+    await waitFor(() =>
+      expect(uploadWithToast).toHaveBeenCalledWith(expect.any(File), {
+        issueId: "issue-1",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        useCommentDraftStore
+          .getState()
+          .getDraftAttachments("new:issue-1"),
+      ).toHaveLength(1),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("editor")).toHaveAttribute(
+        "data-attachment-count",
+        "1",
+      ),
+    );
+
+    fireEvent.click(getSubmitButton(container));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledWith(
+        "/api/attachments/att-1/download",
+        ["att-1"],
+        undefined,
+      );
     });
   });
 

@@ -131,6 +131,12 @@ interface ContentEditorProps {
   onSubmit?: () => void;
   onBlur?: () => void;
   onUploadFile?: (file: File) => Promise<UploadResult | null>;
+  /**
+   * Large text paste handling. Defaults to a plain no-language code block.
+   * Set to "file" only on surfaces whose draft flow persists attachment
+   * records, so reload can still submit the generated file card correctly.
+   */
+  largePasteMode?: "codeBlock" | "file";
   /** Show the floating formatting toolbar on text selection. Defaults true. */
   showBubbleMenu?: boolean;
   /** When true, bare Enter submits (chat-style). Mod-Enter always submits. */
@@ -210,6 +216,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       onSubmit,
       onBlur,
       onUploadFile,
+      largePasteMode = "codeBlock",
       showBubbleMenu = true,
       submitOnEnter = false,
       currentIssueId,
@@ -369,6 +376,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
         queryClient,
         onSubmitRef,
         onUploadFileRef,
+        largePasteMode,
         submitOnEnter,
         disableMentions,
         mentionMode,
